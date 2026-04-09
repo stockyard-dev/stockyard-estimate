@@ -9,13 +9,16 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	"github.com/stockyard-dev/stockyard-estimate/internal/store"
 )
 
 type Server struct {
-	db     *store.DB
-	mux    *http.ServeMux
+	db      *store.DB
+	mux     *http.ServeMux
+	limMu   sync.RWMutex // guards limits, hot-reloadable by /api/license/activate
 	limits  Limits
 	dataDir string
 	pCfg    map[string]json.RawMessage
@@ -43,6 +46,7 @@ func New(db *store.DB, limits Limits, dataDir string) *Server {
 	s.mux.HandleFunc("GET /ui/", s.dashboard)
 	s.mux.HandleFunc("GET /", s.root)
 	s.mux.HandleFunc("GET /api/tier", s.tierHandler)
+	s.mux.HandleFunc("POST /api/license/activate", s.activateLicense)
 	s.mux.HandleFunc("GET /api/config", s.configHandler)
 	s.mux.HandleFunc("GET /api/extras/{resource}", s.listExtras)
 	s.mux.HandleFunc("GET /api/extras/{resource}/{id}", s.getExtras)
@@ -50,58 +54,182 @@ func New(db *store.DB, limits Limits, dataDir string) *Server {
 	return s
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
-func wj(w http.ResponseWriter, c int, v any) { w.Header().Set("Content-Type", "application/json"); w.WriteHeader(c); json.NewEncoder(w).Encode(v) }
+// ServeHTTP wraps the underlying mux with a license-gate middleware.
+// In "none" or "expired" tier states, all writes (POST/PUT/DELETE/PATCH)
+// return 402 EXCEPT POST /api/license/activate. Reads always pass.
+// See booking for the design rationale of this additive port.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.shouldBlockWrite(r) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPaymentRequired)
+		w.Write([]byte(`{"error":"License required. Start a 14-day free trial at https://stockyard.dev/ — or paste an existing license key in the dashboard under \"Activate License\".","tier":"locked"}`))
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
+
+func (s *Server) shouldBlockWrite(r *http.Request) bool {
+	s.limMu.RLock()
+	tier := s.limits.Tier
+	s.limMu.RUnlock()
+	if tier != "none" && tier != "expired" {
+		return false
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	if r.URL.Path == "/api/license/activate" {
+		return false
+	}
+	return true
+}
+
+func (s *Server) activateLicense(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024))
+	if err != nil {
+		we(w, 400, "could not read request body")
+		return
+	}
+	var req struct {
+		LicenseKey string `json:"license_key"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		we(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	key := strings.TrimSpace(req.LicenseKey)
+	if key == "" {
+		we(w, 400, "license_key is required")
+		return
+	}
+	if !ValidateLicenseKeyExported(key) {
+		we(w, 400, "license key is not valid for this product — make sure you copied the entire key from the welcome email, including the SY- prefix")
+		return
+	}
+	if err := PersistLicense(s.dataDir, key); err != nil {
+		log.Printf("estimate: license persist failed: %v", err)
+		we(w, 500, "could not save the license key to disk: "+err.Error())
+		return
+	}
+	s.limMu.Lock()
+	s.limits = DefaultLimits(s.dataDir)
+	newTier := s.limits.Tier
+	s.limMu.Unlock()
+	log.Printf("estimate: license activated via dashboard, persisted to %s/%s, tier=%s", s.dataDir, licenseFilename, newTier)
+	wj(w, 200, map[string]any{
+		"ok":   true,
+		"tier": newTier,
+	})
+}
+func wj(w http.ResponseWriter, c int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(c)
+	json.NewEncoder(w).Encode(v)
+}
 func we(w http.ResponseWriter, c int, m string) { wj(w, c, map[string]string{"error": m}) }
-func (s *Server) root(w http.ResponseWriter, r *http.Request) { if r.URL.Path != "/" { http.NotFound(w, r); return }; http.Redirect(w, r, "/ui", 302) }
-func oe[T any](s []T) []T { if s == nil { return []T{} }; return s }
+func (s *Server) root(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, "/ui", 302)
+}
+func oe[T any](s []T) []T {
+	if s == nil {
+		return []T{}
+	}
+	return s
+}
 func init() { log.SetFlags(log.LstdFlags | log.Lshortfile) }
 
 func (s *Server) listEstimates(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	filters := map[string]string{}
-	if v := r.URL.Query().Get("status"); v != "" { filters["status"] = v }
-	if q != "" || len(filters) > 0 { wj(w, 200, map[string]any{"estimates": oe(s.db.SearchEstimates(q, filters))}); return }
+	if v := r.URL.Query().Get("status"); v != "" {
+		filters["status"] = v
+	}
+	if q != "" || len(filters) > 0 {
+		wj(w, 200, map[string]any{"estimates": oe(s.db.SearchEstimates(q, filters))})
+		return
+	}
 	wj(w, 200, map[string]any{"estimates": oe(s.db.ListEstimates())})
 }
 
 func (s *Server) createEstimates(w http.ResponseWriter, r *http.Request) {
-	if s.limits.Tier == "none" { we(w, 402, "No license key. Start a 14-day trial at https://stockyard.dev/for/"); return }
-	if s.limits.TrialExpired { we(w, 402, "Trial expired. Subscribe at https://stockyard.dev/pricing/"); return }
+	if s.limits.Tier == "none" {
+		we(w, 402, "No license key. Start a 14-day trial at https://stockyard.dev/for/")
+		return
+	}
+	if s.limits.TrialExpired {
+		we(w, 402, "Trial expired. Subscribe at https://stockyard.dev/pricing/")
+		return
+	}
 	var e store.Estimates
 	json.NewDecoder(r.Body).Decode(&e)
-	if e.ClientName == "" { we(w, 400, "client_name required"); return }
-	if e.Title == "" { we(w, 400, "title required"); return }
+	if e.ClientName == "" {
+		we(w, 400, "client_name required")
+		return
+	}
+	if e.Title == "" {
+		we(w, 400, "title required")
+		return
+	}
 	s.db.CreateEstimates(&e)
 	wj(w, 201, s.db.GetEstimates(e.ID))
 }
 
 func (s *Server) getEstimates(w http.ResponseWriter, r *http.Request) {
 	e := s.db.GetEstimates(r.PathValue("id"))
-	if e == nil { we(w, 404, "not found"); return }
+	if e == nil {
+		we(w, 404, "not found")
+		return
+	}
 	wj(w, 200, e)
 }
 
 func (s *Server) updateEstimates(w http.ResponseWriter, r *http.Request) {
 	existing := s.db.GetEstimates(r.PathValue("id"))
-	if existing == nil { we(w, 404, "not found"); return }
+	if existing == nil {
+		we(w, 404, "not found")
+		return
+	}
 	var patch store.Estimates
 	json.NewDecoder(r.Body).Decode(&patch)
-	patch.ID = existing.ID; patch.CreatedAt = existing.CreatedAt
-	if patch.ClientName == "" { patch.ClientName = existing.ClientName }
-	if patch.ClientEmail == "" { patch.ClientEmail = existing.ClientEmail }
-	if patch.ClientPhone == "" { patch.ClientPhone = existing.ClientPhone }
-	if patch.Title == "" { patch.Title = existing.Title }
-	if patch.Description == "" { patch.Description = existing.Description }
-	if patch.ValidUntil == "" { patch.ValidUntil = existing.ValidUntil }
-	if patch.Status == "" { patch.Status = existing.Status }
-	if patch.Notes == "" { patch.Notes = existing.Notes }
+	patch.ID = existing.ID
+	patch.CreatedAt = existing.CreatedAt
+	if patch.ClientName == "" {
+		patch.ClientName = existing.ClientName
+	}
+	if patch.ClientEmail == "" {
+		patch.ClientEmail = existing.ClientEmail
+	}
+	if patch.ClientPhone == "" {
+		patch.ClientPhone = existing.ClientPhone
+	}
+	if patch.Title == "" {
+		patch.Title = existing.Title
+	}
+	if patch.Description == "" {
+		patch.Description = existing.Description
+	}
+	if patch.ValidUntil == "" {
+		patch.ValidUntil = existing.ValidUntil
+	}
+	if patch.Status == "" {
+		patch.Status = existing.Status
+	}
+	if patch.Notes == "" {
+		patch.Notes = existing.Notes
+	}
 	s.db.UpdateEstimates(&patch)
 	wj(w, 200, s.db.GetEstimates(patch.ID))
 }
 
 func (s *Server) delEstimates(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id"); s.db.DeleteEstimates(id); s.db.DeleteExtras("estimates", id)
+	id := r.PathValue("id")
+	s.db.DeleteEstimates(id)
+	s.db.DeleteExtras("estimates", id)
 	wj(w, 200, map[string]string{"deleted": "ok"})
 }
 
@@ -120,39 +248,61 @@ func (s *Server) exportEstimates(w http.ResponseWriter, r *http.Request) {
 func (s *Server) listLineItems(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query().Get("q")
 	filters := map[string]string{}
-	if q != "" || len(filters) > 0 { wj(w, 200, map[string]any{"line_items": oe(s.db.SearchLineItems(q, filters))}); return }
+	if q != "" || len(filters) > 0 {
+		wj(w, 200, map[string]any{"line_items": oe(s.db.SearchLineItems(q, filters))})
+		return
+	}
 	wj(w, 200, map[string]any{"line_items": oe(s.db.ListLineItems())})
 }
 
 func (s *Server) createLineItems(w http.ResponseWriter, r *http.Request) {
 	var e store.LineItems
 	json.NewDecoder(r.Body).Decode(&e)
-	if e.EstimateId == "" { we(w, 400, "estimate_id required"); return }
-	if e.Description == "" { we(w, 400, "description required"); return }
+	if e.EstimateId == "" {
+		we(w, 400, "estimate_id required")
+		return
+	}
+	if e.Description == "" {
+		we(w, 400, "description required")
+		return
+	}
 	s.db.CreateLineItems(&e)
 	wj(w, 201, s.db.GetLineItems(e.ID))
 }
 
 func (s *Server) getLineItems(w http.ResponseWriter, r *http.Request) {
 	e := s.db.GetLineItems(r.PathValue("id"))
-	if e == nil { we(w, 404, "not found"); return }
+	if e == nil {
+		we(w, 404, "not found")
+		return
+	}
 	wj(w, 200, e)
 }
 
 func (s *Server) updateLineItems(w http.ResponseWriter, r *http.Request) {
 	existing := s.db.GetLineItems(r.PathValue("id"))
-	if existing == nil { we(w, 404, "not found"); return }
+	if existing == nil {
+		we(w, 404, "not found")
+		return
+	}
 	var patch store.LineItems
 	json.NewDecoder(r.Body).Decode(&patch)
-	patch.ID = existing.ID; patch.CreatedAt = existing.CreatedAt
-	if patch.EstimateId == "" { patch.EstimateId = existing.EstimateId }
-	if patch.Description == "" { patch.Description = existing.Description }
+	patch.ID = existing.ID
+	patch.CreatedAt = existing.CreatedAt
+	if patch.EstimateId == "" {
+		patch.EstimateId = existing.EstimateId
+	}
+	if patch.Description == "" {
+		patch.Description = existing.Description
+	}
 	s.db.UpdateLineItems(&patch)
 	wj(w, 200, s.db.GetLineItems(patch.ID))
 }
 
 func (s *Server) delLineItems(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id"); s.db.DeleteLineItems(id); s.db.DeleteExtras("lineitems", id)
+	id := r.PathValue("id")
+	s.db.DeleteLineItems(id)
+	s.db.DeleteExtras("lineitems", id)
 	wj(w, 200, map[string]string{"deleted": "ok"})
 }
 

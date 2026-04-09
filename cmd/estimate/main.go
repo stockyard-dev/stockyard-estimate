@@ -48,7 +48,7 @@ func main() {
 	}
 	defer db.Close()
 
-	srv := server.New(db, server.DefaultLimits(), dataDir)
+	srv := server.New(db, server.DefaultLimits(dataDir), dataDir)
 
 	fmt.Printf("\n  Estimate v%s — Self-hosted estimates and quotes with line items\n  Dashboard:  http://localhost:%s/ui\n  API:        http://localhost:%s/api\n  Data:       %s\n  Questions? hello@stockyard.dev — I read every message\n\n", version, port, port, dataDir)
 	log.Printf("estimate: listening on :%s", port)
