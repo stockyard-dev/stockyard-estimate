@@ -77,7 +77,7 @@ func newTestServer(t *testing.T, tier string) *Server {
 	default:
 		t.Fatalf("unknown test tier: %s", tier)
 	}
-	return New(db, lim, dir)
+	return New(db, lim, dir, nil)
 }
 
 func TestShouldBlockWrite_NoneTier(t *testing.T) {

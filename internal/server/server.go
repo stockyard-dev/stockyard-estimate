@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/stockyard-dev/stockyard-estimate/internal/store"
+	"github.com/stockyard-dev/stockyard/bus"
 )
 
 type Server struct {
@@ -22,10 +23,11 @@ type Server struct {
 	limits  Limits
 	dataDir string
 	pCfg    map[string]json.RawMessage
+	bus     *bus.Bus // optional cross-tool event bus; nil if not configured
 }
 
-func New(db *store.DB, limits Limits, dataDir string) *Server {
-	s := &Server{db: db, mux: http.NewServeMux(), limits: limits, dataDir: dataDir}
+func New(db *store.DB, limits Limits, dataDir string, b *bus.Bus) *Server {
+	s := &Server{db: db, mux: http.NewServeMux(), limits: limits, dataDir: dataDir, bus: b}
 	s.loadPersonalConfig()
 	s.mux.HandleFunc("GET /api/estimates", s.listEstimates)
 	s.mux.HandleFunc("POST /api/estimates", s.createEstimates)
@@ -176,7 +178,14 @@ func (s *Server) createEstimates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.db.CreateEstimates(&e)
-	wj(w, 201, s.db.GetEstimates(e.ID))
+	created := s.db.GetEstimates(e.ID)
+	// Creation implies the quote is heading out the door. Subscribers
+	// that want to filter by more specific state can key off
+	// payload.status (draft/sent/accepted/rejected).
+	if created != nil && strings.ToLower(created.Status) == "sent" {
+		s.publishQuote("quote.sent", created)
+	}
+	wj(w, 201, created)
 }
 
 func (s *Server) getEstimates(w http.ResponseWriter, r *http.Request) {
@@ -223,7 +232,21 @@ func (s *Server) updateEstimates(w http.ResponseWriter, r *http.Request) {
 		patch.Notes = existing.Notes
 	}
 	s.db.UpdateEstimates(&patch)
-	wj(w, 200, s.db.GetEstimates(patch.ID))
+	updated := s.db.GetEstimates(patch.ID)
+	// Fire bus events only on status TRANSITIONS. Prevents seeing the
+	// same accepted event every time an admin tweaks notes on an
+	// already-accepted quote.
+	if updated != nil && existing.Status != updated.Status {
+		switch strings.ToLower(updated.Status) {
+		case "sent":
+			s.publishQuote("quote.sent", updated)
+		case "accepted":
+			s.publishQuote("quote.accepted", updated)
+		case "rejected", "declined":
+			s.publishQuote("quote.rejected", updated)
+		}
+	}
+	wj(w, 200, updated)
 }
 
 func (s *Server) delEstimates(w http.ResponseWriter, r *http.Request) {
@@ -396,4 +419,34 @@ func (s *Server) putExtras(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wj(w, 200, map[string]string{"ok": "saved"})
+}
+
+// publishQuote fires a quote.* event on the bus. No-op when bus is
+// nil. Runs in a goroutine; errors logged not surfaced. Payload
+// shape locked by docs/BUS-TOPICS.md v1 in stockyard-desktop.
+//
+// Reality notes:
+// - Estimate has no contact_id FK — client_name/client_email/
+//   client_phone are free-text, same as booking.
+// - Total is a float64 (not cents), units not declared. Treat as
+//   opaque numeric in the tool's native unit.
+func (s *Server) publishQuote(topic string, q *store.Estimates) {
+	if s.bus == nil || q == nil {
+		return
+	}
+	payload := map[string]any{
+		"quote_id":     q.ID,
+		"client_name":  q.ClientName,
+		"client_email": q.ClientEmail,
+		"client_phone": q.ClientPhone,
+		"title":        q.Title,
+		"total":        q.Total,
+		"valid_until":  q.ValidUntil,
+		"status":       q.Status,
+	}
+	go func() {
+		if _, err := s.bus.Publish(topic, payload); err != nil {
+			log.Printf("estimate: bus publish %s failed: %v", topic, err)
+		}
+	}()
 }
